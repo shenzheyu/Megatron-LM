@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer."""
+import wandb
+
 from contextlib import nullcontext
 import math
 import numpy as np
@@ -18,6 +20,11 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+
+def is_rank_0():
+    # if torch.cuda.current_device() == 0:
+    if torch.distributed.get_rank() == 0:
+        return True
 
 try:
     from einops import rearrange
@@ -145,6 +152,9 @@ class ParallelMLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+        # if is_rank_0():
+        #     wandb.log({"mlp_intermediate_output": intermediate_parallel.mean().item()})
+        #     assert bias_parallel is None
         return output, output_bias
 
 class SwitchMLP(MegatronModule):
@@ -671,7 +681,8 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # core attention computation
         # ==================================
-
+        # repeat = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        # assert repeat == 1, '[csy] disable the query groups to enable cuda graph'
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
         key_layer = key_layer.repeat_interleave(
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
@@ -1066,7 +1077,14 @@ class ParallelTransformerLayer(MegatronModule):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
-        layernorm_output = self.input_layernorm(hidden_states)
+        # hidden_states_0 = hidden_states[:, :2, :]
+        # hidden_states_1 = hidden_states[:, 2:, :]
+        # layernorm_output_0 = self.input_layernorm(hidden_states_0)
+        # layernorm_output_1 = self.input_layernorm(hidden_states_1)
+        # layernorm_output = torch.cat([layernorm_output_0, layernorm_output_1], dim=1)
+        layernorm_output_old = self.input_layernorm(hidden_states)
+        layernorm_output = layernorm_output_old
+        # print("layernorm_output shape: ", layernorm_output.shape)
 
         # Self attention.
         attention_output, attention_bias = \
@@ -1080,7 +1098,8 @@ class ParallelTransformerLayer(MegatronModule):
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
         else:
-            residual = hidden_states
+            residual_old = hidden_states
+        residual = residual_old
 
         if self.drop_path is None:
             # jit scripting for a nn.module (with dropout) is not
@@ -1098,11 +1117,30 @@ class ParallelTransformerLayer(MegatronModule):
             if attention_bias is not None:
                 attention_bias = attention_bias.expand_as(residual)
             with self.bias_dropout_add_exec_handler():
-                layernorm_input = bias_dropout_add_func(
-                    attention_output,
-                    attention_bias,
-                    residual,
-                    self.hidden_dropout)
+                # attention_output_0 = attention_output[:, :2, :]
+                # attention_output_1 = attention_output[:, 2:, :]
+                # residual_0 = residual[:, :2, :]
+                # residual_1 = residual[:, 2:, :]
+                # layernorm_input_0 = bias_dropout_add_func(
+                #     attention_output_0,
+                #     attention_bias,
+                #     residual_0,
+                #     self.hidden_dropout)
+                # layernorm_input_1 = bias_dropout_add_func(
+                #     attention_output_1,
+                #     attention_bias,
+                #     residual_1,
+                #     self.hidden_dropout)
+                # layernorm_input = torch.cat([layernorm_input_0, layernorm_input_1], dim=1)
+                # layernorm_input = bias_dropout_add_func(
+                #     attention_output,
+                #     attention_bias,
+                #     residual,
+                #     self.hidden_dropout)
+                if attention_bias is not None:
+                    attention_output = attention_output + attention_bias
+                layernorm_input = torch.nn.functional.dropout(attention_output, p=self.hidden_dropout, training=self.training)
+                layernorm_input = residual + layernorm_input
         else:
             out = torch.nn.functional.dropout(attention_output + attention_bias,
                                               p=self.hidden_dropout,
@@ -1110,6 +1148,11 @@ class ParallelTransformerLayer(MegatronModule):
             layernorm_input = residual + self.drop_path(out)
 
         # Layer norm post the self attention.
+        # layernorm_input_0 = layernorm_input[:, :2, :]
+        # layernorm_input_1 = layernorm_input[:, 2:, :]
+        # layernorm_output_0 = self.post_attention_layernorm(layernorm_input_0)
+        # layernorm_output_1 = self.post_attention_layernorm(layernorm_input_1)
+        # layernorm_output = torch.cat([layernorm_output_0, layernorm_output_1], dim=1)
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
         # Cross attention.
@@ -1181,6 +1224,19 @@ class ParallelTransformerLayer(MegatronModule):
                                               p=self.hidden_dropout,
                                               training=self.training)
             output = residual + self.drop_path(out)
+
+        # if is_rank_0():
+        #     with torch.no_grad():
+        #         wandb.log({"input": torch.mean(hidden_states).item()})
+        #         wandb.log({"layernorm_output_old": torch.mean(layernorm_output_old).item()})
+        #         wandb.log({"attention_output": torch.mean(attention_output).item()})
+        #         assert attention_bias is None
+        #         wandb.log({"residual_old": torch.mean(residual_old).item()})
+        #         wandb.log({"residual": torch.mean(residual).item()})
+        #         wandb.log({"layernorm_input": torch.mean(layernorm_input).item()})
+        #         wandb.log({"layernorm_output": torch.mean(layernorm_output).item()})
+        #         wandb.log({"mlp_output": torch.mean(mlp_output).item()})
+        #         wandb.log({"output": torch.mean(output).item()})
 
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output
