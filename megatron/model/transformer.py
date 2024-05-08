@@ -25,6 +25,11 @@ def is_rank_0():
     # if torch.cuda.current_device() == 0:
     if torch.distributed.get_rank() == 0:
         return True
+    
+def print_rank_0(*args):
+    return
+    if is_rank_0():
+        print(*args)
 
 try:
     from einops import rearrange
@@ -803,6 +808,11 @@ class ParallelTransformerLayer(MegatronModule):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
+        print("config.hidden_size", config.hidden_size)
+        print("config.layernorm_epsilon", config.layernorm_epsilon)
+        print("config.persist_layer_norm", config.persist_layer_norm)
+        print("config.sequence_parallel", config.sequence_parallel)
+        print("args.apply_layernorm_1p", args.apply_layernorm_1p)
         self.post_attention_layernorm = LayerNorm(
             config.hidden_size,
             eps=config.layernorm_epsilon,
@@ -1076,23 +1086,43 @@ class ParallelTransformerLayer(MegatronModule):
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
+        print_rank_0("hidden_states: ", hidden_states)
+
         # Layer norm at the beginning of the transformer layer.
         # hidden_states_0 = hidden_states[:, :2, :]
         # hidden_states_1 = hidden_states[:, 2:, :]
         # layernorm_output_0 = self.input_layernorm(hidden_states_0)
         # layernorm_output_1 = self.input_layernorm(hidden_states_1)
         # layernorm_output = torch.cat([layernorm_output_0, layernorm_output_1], dim=1)
-        layernorm_output_old = self.input_layernorm(hidden_states)
-        layernorm_output = layernorm_output_old
+        layernorm_output = self.input_layernorm(hidden_states)
         # print("layernorm_output shape: ", layernorm_output.shape)
+        print_rank_0("layernorm_output: ", layernorm_output)
 
         # Self attention.
+        # layernorm_output_0 = layernorm_output[:, :2, :]
+        # layernorm_output_1 = layernorm_output[:, 2:, :]
+        # attention_output_0, attention_bias_0 = \
+        #     self.self_attention(
+        #         layernorm_output_0,
+        #         attention_mask,
+        #         inference_params=inference_params,
+        #         rotary_pos_emb=rotary_pos_emb)
+        # attention_output_1, attention_bias_1 = \
+        #     self.self_attention(
+        #         layernorm_output_1,
+        #         attention_mask,
+        #         inference_params=inference_params,
+        #         rotary_pos_emb=rotary_pos_emb)
+        # attention_output = torch.cat([attention_output_0, attention_output_1], dim=1)
+        # attention_bias = None
         attention_output, attention_bias = \
             self.self_attention(
                 layernorm_output,
                 attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
+        
+        print_rank_0("attention_output: ", attention_output)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1100,6 +1130,7 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             residual_old = hidden_states
         residual = residual_old
+        print_rank_0("residual: ", residual)
 
         if self.drop_path is None:
             # jit scripting for a nn.module (with dropout) is not
@@ -1141,6 +1172,7 @@ class ParallelTransformerLayer(MegatronModule):
                     attention_output = attention_output + attention_bias
                 layernorm_input = torch.nn.functional.dropout(attention_output, p=self.hidden_dropout, training=self.training)
                 layernorm_input = residual + layernorm_input
+                print_rank_0("layernorm_input: ", layernorm_input)
         else:
             out = torch.nn.functional.dropout(attention_output + attention_bias,
                                               p=self.hidden_dropout,
@@ -1154,6 +1186,7 @@ class ParallelTransformerLayer(MegatronModule):
         # layernorm_output_1 = self.post_attention_layernorm(layernorm_input_1)
         # layernorm_output = torch.cat([layernorm_output_0, layernorm_output_1], dim=1)
         layernorm_output = self.post_attention_layernorm(layernorm_input)
+        print_rank_0("layernorm_output: ", layernorm_output)
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:
@@ -1190,6 +1223,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # MLP.
         mlp_output, mlp_bias = self.mlp(layernorm_output)
+        print_rank_0("mlp_output: ", mlp_output)
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1225,9 +1259,12 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             output = residual + self.drop_path(out)
 
+        print_rank_0("output: ", output)
+
         # if is_rank_0():
         #     with torch.no_grad():
         #         wandb.log({"input": torch.mean(hidden_states).item()})
+        #         # wandb.log({"layernorm_input_dropout": torch.mean(layernorm_input_dropout).item()})
         #         wandb.log({"layernorm_output_old": torch.mean(layernorm_output_old).item()})
         #         wandb.log({"attention_output": torch.mean(attention_output).item()})
         #         assert attention_bias is None
