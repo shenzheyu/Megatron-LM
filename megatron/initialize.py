@@ -18,7 +18,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.arguments import parse_args, validate_args
 from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
-from megatron.model.transformer import bias_dropout_add_fused_train
+# from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 
 
@@ -343,7 +343,8 @@ def _warmup_jit_function():
         input.requires_grad = input_grad
         bias.requires_grad = bias_grad
         residual.requires_grad = residual_grad
-        for _ in range(5):
-            output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
-    del bias, input, residual, output
+        # for _ in range(5):
+        #     output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
+    # del bias, input, residual, output
+    del bias, input, residual
     torch.cuda.empty_cache()

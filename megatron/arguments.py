@@ -328,6 +328,7 @@ def validate_args(args, defaults={}):
     # disable sequence parallelism when tp=1
     # to avoid change in numerics when
     # sequence_parallelism is enabled.
+    args.sequence_parallel = False
     if args.tensor_model_parallel_size == 1:
         args.sequence_parallel = False
 
@@ -465,7 +466,12 @@ def _add_transformer_engine_args(parser):
                        choices=['LayerNorm', 'RMSNorm'],
                        help='Which normalization technique to use.',
                        dest='normalization')
-
+    group.add_argument('--causal-lm', default=True,
+                       action='store_true', help='Causal output',
+                       dest='causal_lm')
+    group.add_argument('--llama-model', default=False,
+                       action='store_true', help='Use LLAMA model',
+                       dest='llama_model')
     return parser
 
 def _add_inference_args(parser):
@@ -571,10 +577,16 @@ def _add_network_size_args(parser):
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
+    group.add_argument('--rotary-base', type=int, default=10000,
+                       help='Base to use for rotary positional embeddings, default 10000')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
+    group.add_argument('--rotary-interleaved', action='store_true',
+                          help='Use interleaved rotary embedding.')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
+    group.add_argument('--use-rope-scaling', action='store_true',
+                       help='Apply rope scaling as used in llama3.1')
     group.add_argument('--no-position-embedding',
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
@@ -1148,6 +1160,7 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
+                                'HuggingFaceTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,

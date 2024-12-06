@@ -144,6 +144,7 @@ class TransformerConfig(ModelParallelConfig):
     add_bias_linear: bool = True
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
+    rotary_interleaved: bool = False
 
     # initialization
     init_method: Callable = None
@@ -178,6 +179,9 @@ class TransformerConfig(ModelParallelConfig):
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
+
+    flash_decode: bool = False
+    """ Use the optimized flash decoding kernel during inference. """
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
