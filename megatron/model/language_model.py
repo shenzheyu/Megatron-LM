@@ -2,13 +2,15 @@
 
 """Transformer based language model."""
 
+from typing import Dict, Literal, Optional
+
 import torch
 import torch.nn.functional as F
 
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
@@ -73,7 +75,12 @@ def get_language_model(config, num_tokentypes, add_pooler,
         decoder_attn_mask_type=decoder_attn_mask_type,
         add_pooler=add_pooler,
         pre_process=pre_process,
-        post_process=post_process
+        post_process=post_process,
+        position_embedding_type = args.position_embedding_type,
+        rotary_percent = args.rotary_percent,
+        rotary_base = args.rotary_base,
+        rope_scaling = args.use_rope_scaling,
+        seq_len_interpolation_factor = args.rotary_seq_len_interpolation_factor,
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -339,12 +346,18 @@ class TransformerLanguageModel(MegatronModule):
                  decoder_attn_mask_type=AttnMaskType.causal,
                  add_pooler=False,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
+                 rotary_percent: float = 1.0,
+                 rotary_base: int = 10000,
+                 rope_scaling: bool = False,
+                 seq_len_interpolation_factor: Optional[float] = None,):
         args = get_args()
         # TODO: passing share_embeddings_and_output_weights=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
         if args.untie_embeddings_and_output_weights: assert not add_decoder
         super(TransformerLanguageModel, self).__init__(share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
 
+        self.config = config
         self.pre_process = pre_process
         self.post_process = post_process
         self.hidden_size = config.hidden_size
@@ -358,6 +371,11 @@ class TransformerLanguageModel(MegatronModule):
         self.encoder_hidden_state = None
         self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+
+        self.position_embedding_type = position_embedding_type
+        self.rotary_percent = rotary_percent
+        self.rotary_base = rotary_base
+        self.rotary_scaling = rope_scaling
 
         # Embeddings.
         if self.pre_process:
@@ -374,19 +392,14 @@ class TransformerLanguageModel(MegatronModule):
         self.use_rotary_position_embeddings = \
             args.position_embedding_type == 'rope'
         if self.use_rotary_position_embeddings:
-            self.seq_length = args.seq_length
-            rotary_dim = args.hidden_size // args.num_attention_heads \
-                if args.kv_channels is None else args.kv_channels
-
-            if args.rotary_percent < 1.0:
-                rotary_dim = int(rotary_dim * args.rotary_percent)
-
-            # partial rotary embeddings, which is better than full rotary
-            # Wang and Komatsuzaki et al
-            # https://github.com/kingoflolz/mesh-transformer-jax/
             self.rotary_pos_emb = RotaryEmbedding(
-                rotary_dim,
-                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                rope_scaling=rope_scaling,
+                use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
         # Encoder (usually set to True, False if part of an encoder-decoder
@@ -469,7 +482,7 @@ class TransformerLanguageModel(MegatronModule):
                 enc_dec_attn_mask=None, tokentype_ids=None,
                 inference_params=None,
                 pooling_sequence_index=0,
-                enc_hidden_states=None, output_enc_hidden=False):
+                enc_hidden_states=None, output_enc_hidden=False,):
 
         # Encoder embedding.
         if self.pre_process:
@@ -486,25 +499,24 @@ class TransformerLanguageModel(MegatronModule):
         else:
             retriever_input = None
 
-        # Rotary positional embeddings
-        rotary_pos_emb = None
-        if self.use_rotary_position_embeddings:
-            if inference_params is not None:
-                rotary_pos_emb = \
-                    self.rotary_pos_emb(inference_params.max_sequence_length)
-            else:
-                rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
 
         # Run encoder.
+        # print(encoder_input)
         if enc_hidden_states is None:
             if self.encoder is not None:
+                encoder_out_size = encoder_input.shape
+                p_batch_size = encoder_out_size[1] // 2
+                dtype = encoder_input.dtype
+                # encoder_output_t = torch.zeros(encoder_out_size, dtype=dtype, device=torch.cuda.current_device())
+                encoder_output_t = torch.empty(encoder_out_size, dtype=dtype, device=torch.cuda.current_device())
+                intra_partitions = 2
+                # encoder_inputs = torch.tensor_split(encoder_input, intra_partitions, dim=1)
                 encoder_output = self.encoder(
                     encoder_input,
                     enc_attn_mask,
                     retriever_input=retriever_input,
                     retriever_attn_mask=retriever_attn_mask,
-                    inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb)
+                    inference_params=inference_params)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -537,8 +549,7 @@ class TransformerLanguageModel(MegatronModule):
             dec_attn_mask,
             encoder_output=encoder_output,
             enc_dec_attn_mask=enc_dec_attn_mask,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb)
+            inference_params=inference_params,)
 
         if self.add_pooler and self.post_process:
             return decoder_output, encoder_output, pooled_output
